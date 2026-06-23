@@ -26,6 +26,12 @@ POLL_INTERVAL    = 0.5   # seconds between polls
 DEFAULT_STABILITY_WINDOW = 20.0   # seconds the value must not change before saving
 STABILITY_TOLERANCE      = 0.05   # grams of drift allowed during the window
 
+# After each reading the pan returns to ~0. Once the weight sits within ZERO_BAND
+# of zero for RETARE_DELAY seconds, the scale is auto-re-tared (to cancel drift)
+# and the app arms for the next measurement.
+ZERO_BAND    = 2.0   # grams — |weight| within this counts as "back to zero"
+RETARE_DELAY = 3.0   # seconds to hold at ~0 before the automatic re-tare
+
 # Carousel layout — must match the HT03RA100 firmware: 8 samples, each measured
 # 5 times (the probe dips onto each sample 5×). Every 5 detected weigh-events
 # therefore belong to ONE physical sample; samples are numbered 1..8. The run
@@ -56,6 +62,7 @@ class ScaleApp:
         self.results      = []
         self.stable_ref      = None     # reference weight for the stability window
         self.stable_since    = None     # time.monotonic() when the current steady streak began
+        self.zero_since      = None     # time.monotonic() when the pan returned to ~0 after a reading
         self.stability_window = DEFAULT_STABILITY_WINDOW  # seconds; set from the UI at Start
 
         self._build_ui()
@@ -254,6 +261,7 @@ class ScaleApp:
         self.state        = 'WAITING'
         self.stable_ref   = None
         self.stable_since = None
+        self.zero_since   = None
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._send(b'T\r\n')        # auto-tare the scale at the start of the run
@@ -357,11 +365,28 @@ class ScaleApp:
                                     f"holding {int(held)}/{int(self.stability_window)} s...")
 
         elif self.state == 'RECORDED':
-            if weight < EMPTY_THRESHOLD:
-                self.state = 'WAITING'
-                self.root.after(0, self.status_var.set,
-                                f"Waiting for sample {self._next_sample_num()} · "
-                                f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE}...")
+            # Wait for the pan to drop back to ~0, hold RETARE_DELAY seconds, then
+            # auto-re-tare and arm for the next reading.
+            if abs(weight) <= ZERO_BAND:
+                if self.zero_since is None:
+                    self.zero_since = time.monotonic()
+                held0 = time.monotonic() - self.zero_since
+                if held0 >= RETARE_DELAY:
+                    self._send(b'T\r\n')          # re-tare to cancel any drift
+                    self.state        = 'WAITING'
+                    self.zero_since   = None
+                    self.stable_ref   = None
+                    self.stable_since = None
+                    self.root.after(0, self.status_var.set,
+                                    f"Re-tared — waiting for sample {self._next_sample_num()} · "
+                                    f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE}...")
+                else:
+                    self.root.after(0, self.status_var.set,
+                                    f"Back to zero — re-taring in "
+                                    f"{int(RETARE_DELAY - held0) + 1} s...")
+            else:
+                # not back to ~0 yet (probe still lifting / residual) — keep waiting
+                self.zero_since = None
 
     def _record(self, weight, unit):
         idx        = self.meas_count                      # 0-based measurement index
