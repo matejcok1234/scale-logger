@@ -19,11 +19,12 @@ SAMPLE_THRESHOLD = 70.0  # grams — above this = sample on scale (record it)
 EMPTY_THRESHOLD  = 10.0  # grams — below this = scale empty (ready for next reading)
 POLL_INTERVAL    = 0.5   # seconds between polls
 
-# A reading is only saved once the weight has held steady for this long. The
-# value must stay within STABILITY_TOLERANCE (and the scale must report stable)
-# for STABILITY_WINDOW continuous seconds; any change restarts the timer.
-STABILITY_WINDOW    = 20.0   # seconds the value must not change before saving
-STABILITY_TOLERANCE = 0.05   # grams of drift allowed during the window
+# A reading is only saved once the weight has held steady for a chosen length of
+# time. The value must stay within STABILITY_TOLERANCE (and the scale must report
+# stable) for that many continuous seconds; any change restarts the timer. The
+# duration is set by the user in the UI — this is just the starting default.
+DEFAULT_STABILITY_WINDOW = 20.0   # seconds the value must not change before saving
+STABILITY_TOLERANCE      = 0.05   # grams of drift allowed during the window
 
 # Carousel layout — must match the HT03RA100 firmware: 8 samples, each measured
 # 5 times (the probe dips onto each sample 5×). Every 5 detected weigh-events
@@ -53,8 +54,9 @@ class ScaleApp:
         self.state        = 'WAITING'   # WAITING | SETTLING | RECORDED
         self.meas_count   = 0           # total measurements recorded this run (grows until Stop)
         self.results      = []
-        self.stable_ref   = None        # reference weight for the 20 s stability window
-        self.stable_since = None        # time.monotonic() when the current steady streak began
+        self.stable_ref      = None     # reference weight for the stability window
+        self.stable_since    = None     # time.monotonic() when the current steady streak began
+        self.stability_window = DEFAULT_STABILITY_WINDOW  # seconds; set from the UI at Start
 
         self._build_ui()
         self._refresh_ports()
@@ -123,6 +125,15 @@ class ScaleApp:
             bg=RED, fg='white', font=('Arial', 12, 'bold'),
             relief='flat', cursor='hand2', pady=6)
         self.btn_stop.pack(side='left')
+
+        # How long the weight must hold steady before a reading is saved.
+        sf = tk.Frame(cf, bg=BG)
+        sf.pack(side='right')
+        tk.Label(sf, text="Stabilize for (s):", bg=BG).pack(side='left', padx=(0, 4))
+        self.stab_var = tk.StringVar(value=str(int(DEFAULT_STABILITY_WINDOW)))
+        self.stab_spin = tk.Spinbox(sf, textvariable=self.stab_var, from_=1, to=600,
+                                    increment=1, width=5, justify='center')
+        self.stab_spin.pack(side='left')
 
         # Status
         self.status_var = tk.StringVar(value="Not connected")
@@ -228,6 +239,16 @@ class ScaleApp:
         return self.meas_count % MEAS_PER_SAMPLE + 1
 
     def _start_run(self):
+        # Lock in the user-chosen stabilization time for this run.
+        try:
+            secs = float(str(self.stab_var.get()).replace(',', '.'))
+            if secs < 1:
+                raise ValueError
+        except ValueError:
+            secs = DEFAULT_STABILITY_WINDOW
+            self.stab_var.set(str(int(secs)))
+        self.stability_window = secs
+
         self.results      = []
         self.meas_count   = 0
         self.state        = 'WAITING'
@@ -239,13 +260,16 @@ class ScaleApp:
         self.running = True
         self.btn_start.config(state='disabled')
         self.btn_stop.config(state='normal')
+        self.stab_spin.config(state='disabled')   # can't change mid-run
         self.status_var.set(
-            f"Tared — waiting for sample 1 · meas 1/{MEAS_PER_SAMPLE}  (runs until you press Stop)")
+            f"Tared — waiting for sample 1 · meas 1/{MEAS_PER_SAMPLE}  "
+            f"(hold {int(self.stability_window)} s to save; runs until you press Stop)")
 
     def _stop_run(self):
         self.running = False
         self.btn_start.config(state='normal')
         self.btn_stop.config(state='disabled')
+        self.stab_spin.config(state='normal')
         n = len(self.results)
         self.status_var.set(f"Stopped — {n} measurement{'s' if n != 1 else ''} recorded")
         if self.results:
@@ -303,7 +327,7 @@ class ScaleApp:
                 self.root.after(0, self.status_var.set,
                                 f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
                                 f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — "
-                                f"holding 0/{int(STABILITY_WINDOW)} s...")
+                                f"holding 0/{int(self.stability_window)} s...")
 
         elif self.state == 'SETTLING':
             if weight < EMPTY_THRESHOLD:
@@ -321,16 +345,16 @@ class ScaleApp:
                 self.root.after(0, self.status_var.set,
                                 f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
                                 f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — "
-                                f"value changed, restarting {int(STABILITY_WINDOW)} s...")
+                                f"value changed, restarting {int(self.stability_window)} s...")
             else:
                 held = time.monotonic() - self.stable_since
-                if held >= STABILITY_WINDOW:
+                if held >= self.stability_window:
                     self._record(weight, unit)
                 else:
                     self.root.after(0, self.status_var.set,
                                     f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
                                     f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — "
-                                    f"holding {int(held)}/{int(STABILITY_WINDOW)} s...")
+                                    f"holding {int(held)}/{int(self.stability_window)} s...")
 
         elif self.state == 'RECORDED':
             if weight < EMPTY_THRESHOLD:
