@@ -15,9 +15,18 @@ try:
 except ImportError:
     HAS_EXCEL = False
 
-SAMPLE_THRESHOLD = 50.0  # grams — above this = sample on scale
-EMPTY_THRESHOLD  = 10.0  # grams — below this = scale empty
+SAMPLE_THRESHOLD = 70.0  # grams — above this = sample on scale (record it)
+EMPTY_THRESHOLD  = 10.0  # grams — below this = scale empty (ready for next reading)
 POLL_INTERVAL    = 0.5   # seconds between polls
+
+# Carousel layout — must match the HT03RA100 firmware: 8 samples, each measured
+# 5 times (the probe dips onto each sample 5×). Every 5 detected weigh-events
+# therefore belong to ONE physical sample; samples are numbered 1..8. The run
+# repeats the whole carousel indefinitely (until the user presses Stop), so a
+# "cycle" counter increments each time all 8 samples have been measured 5× again.
+N_SAMPLES        = 8
+MEAS_PER_SAMPLE  = 5
+SET_SIZE         = N_SAMPLES * MEAS_PER_SAMPLE   # 40 readings = one full cycle
 
 BG = '#f4f4f4'
 BLUE  = '#1565C0'
@@ -36,7 +45,7 @@ class ScaleApp:
         self.serial_lock  = threading.Lock()
         self.running      = False
         self.state        = 'WAITING'   # WAITING | SETTLING | RECORDED
-        self.sample_count = 0
+        self.meas_count   = 0           # total measurements recorded this run (grows until Stop)
         self.results      = []
 
         self._build_ui()
@@ -76,11 +85,11 @@ class ScaleApp:
         self.stability_lbl.pack(side='left', padx=16)
 
         # Sample names
-        nf = tk.LabelFrame(self.root, text="Sample Names  (fill in before starting)", bg=BG, font=('Arial', 9))
+        nf = tk.LabelFrame(self.root, text="Sample Names  (8 samples, each measured 5× — fill in before starting)", bg=BG, font=('Arial', 9))
         nf.grid(row=2, column=0, sticky='ew', **p)
 
         self.name_vars = []
-        for i in range(8):
+        for i in range(N_SAMPLES):
             r, c = divmod(i, 2)
             var = tk.StringVar(value=f"Sample {i+1}")
             self.name_vars.append(var)
@@ -116,16 +125,20 @@ class ScaleApp:
         tf = tk.LabelFrame(self.root, text="Recorded Samples", bg=BG, font=('Arial', 9))
         tf.grid(row=5, column=0, sticky='nsew', **p)
 
-        cols = ('num', 'name', 'weight', 'time')
+        cols = ('cycle', 'sample', 'meas', 'name', 'weight', 'time')
         self.tree = ttk.Treeview(tf, columns=cols, show='headings', height=10)
-        self.tree.heading('num',    text='#')
-        self.tree.heading('name',   text='Sample')
+        self.tree.heading('cycle',  text='Cycle')
+        self.tree.heading('sample', text='Sample')
+        self.tree.heading('meas',   text='Meas')
+        self.tree.heading('name',   text='Name')
         self.tree.heading('weight', text='Weight')
         self.tree.heading('time',   text='Time')
-        self.tree.column('num',    width=35,  anchor='center')
-        self.tree.column('name',   width=180)
-        self.tree.column('weight', width=120, anchor='center')
-        self.tree.column('time',   width=90,  anchor='center')
+        self.tree.column('cycle',  width=50,  anchor='center')
+        self.tree.column('sample', width=55,  anchor='center')
+        self.tree.column('meas',   width=50,  anchor='center')
+        self.tree.column('name',   width=160)
+        self.tree.column('weight', width=115, anchor='center')
+        self.tree.column('time',   width=85,  anchor='center')
 
         sb = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -194,23 +207,37 @@ class ScaleApp:
 
     # ── Run control ────────────────────────────────────────────────────────────
 
+    def _next_cycle_num(self):
+        # 1-based cycle (full pass through all 8 samples) for the next reading
+        return self.meas_count // SET_SIZE + 1
+
+    def _next_sample_num(self):
+        # 1-based sample number (1..8) for the NEXT measurement, wrapping each cycle
+        return self.meas_count % SET_SIZE // MEAS_PER_SAMPLE + 1
+
+    def _next_meas_num(self):
+        # 1-based measurement index (1..MEAS_PER_SAMPLE) within the current sample
+        return self.meas_count % MEAS_PER_SAMPLE + 1
+
     def _start_run(self):
-        self.results      = []
-        self.sample_count = 0
-        self.state        = 'WAITING'
+        self.results    = []
+        self.meas_count = 0
+        self.state      = 'WAITING'
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self._send(b'T\r\n')        # auto-tare the scale at the start of the run
         self.running = True
         self.btn_start.config(state='disabled')
         self.btn_stop.config(state='normal')
-        self.status_var.set("Waiting for sample 1...")
+        self.status_var.set(
+            f"Tared — waiting for sample 1 · meas 1/{MEAS_PER_SAMPLE}  (runs until you press Stop)")
 
     def _stop_run(self):
         self.running = False
         self.btn_start.config(state='normal')
         self.btn_stop.config(state='disabled')
         n = len(self.results)
-        self.status_var.set(f"Stopped — {n} sample{'s' if n != 1 else ''} recorded")
+        self.status_var.set(f"Stopped — {n} measurement{'s' if n != 1 else ''} recorded")
         if self.results:
             self._export()
 
@@ -264,43 +291,54 @@ class ScaleApp:
                 else:
                     self.state = 'SETTLING'
                     self.root.after(0, self.status_var.set,
-                                    f"Sample {self.sample_count + 1} detected — settling...")
+                                    f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
+                                    f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — settling...")
 
         elif self.state == 'SETTLING':
             if weight < EMPTY_THRESHOLD:
                 # weight dropped before stable — false alarm, reset
                 self.state = 'WAITING'
                 self.root.after(0, self.status_var.set,
-                                f"Waiting for sample {self.sample_count + 1}...")
+                                f"Waiting for sample {self._next_sample_num()} · "
+                                f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE}...")
             elif stable:
                 self._record(weight, unit)
 
         elif self.state == 'RECORDED':
             if weight < EMPTY_THRESHOLD:
                 self.state = 'WAITING'
-                nxt = self.sample_count + 1
-                self.root.after(0, self.status_var.set, f"Waiting for sample {nxt}...")
+                self.root.after(0, self.status_var.set,
+                                f"Waiting for sample {self._next_sample_num()} · "
+                                f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE}...")
 
     def _record(self, weight, unit):
-        self.sample_count += 1
-        idx  = self.sample_count - 1
-        name = self.name_vars[idx].get() if idx < 8 else f"Sample {self.sample_count}"
+        idx        = self.meas_count                      # 0-based measurement index
+        cycle_num  = idx // SET_SIZE + 1                  # 1, 2, 3, ... (full carousel pass)
+        within_set = idx % SET_SIZE                        # 0..39 within this cycle
+        sample_idx = within_set // MEAS_PER_SAMPLE        # 0..N_SAMPLES-1
+        sample_num = sample_idx + 1                       # 1..8  (never 0-based)
+        meas_num   = within_set % MEAS_PER_SAMPLE + 1     # 1..MEAS_PER_SAMPLE
+        name = self.name_vars[sample_idx].get()           # sample_idx is always 0..7
         now  = datetime.datetime.now()
 
         entry = {
-            'num':    self.sample_count,
+            'cycle':  cycle_num,
+            'sample': sample_num,
+            'meas':   meas_num,
             'name':   name,
             'weight': weight,
             'unit':   unit,
             'date':   now.strftime('%Y-%m-%d'),
             'time':   now.strftime('%H:%M:%S'),
         }
-        self.results.append(entry)
+        self.results.append(entry)        # every individual reading is kept (no averaging)
+        self.meas_count += 1
         self.state = 'RECORDED'
 
         self.root.after(0, self._add_row, entry)
         self.root.after(0, self.status_var.set,
-                        f"✓  {name}: {weight:.3f} {unit}   —   remove sample")
+                        f"✓  cycle {cycle_num} · {name} · meas {meas_num}/{MEAS_PER_SAMPLE}: "
+                        f"{weight:.3f} {unit}   —   lift / remove")
 
     # ── Display ────────────────────────────────────────────────────────────────
 
@@ -313,7 +351,9 @@ class ScaleApp:
 
     def _add_row(self, entry):
         self.tree.insert('', 'end', values=(
-            entry['num'],
+            entry['cycle'],
+            entry['sample'],
+            f"{entry['meas']}/{MEAS_PER_SAMPLE}",
             entry['name'],
             f"{entry['weight']:.3f} {entry['unit']}",
             entry['time'],
@@ -332,9 +372,10 @@ class ScaleApp:
         csv_path = base + '.csv'
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
-            w.writerow(['#', 'Sample', 'Weight', 'Unit', 'Date', 'Time'])
+            w.writerow(['Cycle', 'Sample #', 'Measurement', 'Sample Name', 'Weight', 'Unit', 'Date', 'Time'])
             for r in self.results:
-                w.writerow([r['num'], r['name'], r['weight'], r['unit'], r['date'], r['time']])
+                w.writerow([r['cycle'], r['sample'], r['meas'], r['name'],
+                            r['weight'], r['unit'], r['date'], r['time']])
         saved.append(os.path.basename(csv_path))
 
         # Excel
@@ -348,18 +389,20 @@ class ScaleApp:
             hb = PatternFill('solid', fgColor='1565C0')
             ac = Alignment(horizontal='center')
 
-            headers = ['#', 'Sample', 'Weight', 'Unit', 'Date', 'Time']
+            headers = ['Cycle', 'Sample #', 'Measurement', 'Sample Name', 'Weight', 'Unit', 'Date', 'Time']
             for ci, h in enumerate(headers, 1):
                 cell = ws.cell(row=1, column=ci, value=h)
                 cell.font, cell.fill, cell.alignment = hf, hb, ac
 
             for ri, r in enumerate(self.results, 2):
-                ws.cell(ri, 1, r['num'])
-                ws.cell(ri, 2, r['name'])
-                ws.cell(ri, 3, r['weight'])
-                ws.cell(ri, 4, r['unit'])
-                ws.cell(ri, 5, r['date'])
-                ws.cell(ri, 6, r['time'])
+                ws.cell(ri, 1, r['cycle'])
+                ws.cell(ri, 2, r['sample'])
+                ws.cell(ri, 3, r['meas'])
+                ws.cell(ri, 4, r['name'])
+                ws.cell(ri, 5, r['weight'])
+                ws.cell(ri, 6, r['unit'])
+                ws.cell(ri, 7, r['date'])
+                ws.cell(ri, 8, r['time'])
 
             for col in ws.columns:
                 width = max(len(str(c.value or '')) for c in col) + 4

@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed to publish the .exe as a release asset
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,9 +25,22 @@ jobs:
       - name: Build EXE
         run: pyinstaller --onefile --windowed --name ScaleLogger scale_gui.py
 
-      - name: Upload EXE
+      # Fallback download (zipped) under the workflow run's "Artifacts".
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ScaleLogger-Windows
           path: dist/ScaleLogger.exe
           retention-days: 90
+
+      # Plug-and-play: attach the raw .exe to a rolling "latest" release so it
+      # has a permanent direct-download URL (no login, no unzip).
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest ScaleLogger build
+          body: |
+            Standalone Windows build of ScaleLogger (auto-built from main).
+            Download **ScaleLogger.exe** below and double-click it — no install needed.
+          files: dist/ScaleLogger.exe
