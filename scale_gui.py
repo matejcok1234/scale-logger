@@ -19,6 +19,12 @@ SAMPLE_THRESHOLD = 70.0  # grams — above this = sample on scale (record it)
 EMPTY_THRESHOLD  = 10.0  # grams — below this = scale empty (ready for next reading)
 POLL_INTERVAL    = 0.5   # seconds between polls
 
+# A reading is only saved once the weight has held steady for this long. The
+# value must stay within STABILITY_TOLERANCE (and the scale must report stable)
+# for STABILITY_WINDOW continuous seconds; any change restarts the timer.
+STABILITY_WINDOW    = 20.0   # seconds the value must not change before saving
+STABILITY_TOLERANCE = 0.05   # grams of drift allowed during the window
+
 # Carousel layout — must match the HT03RA100 firmware: 8 samples, each measured
 # 5 times (the probe dips onto each sample 5×). Every 5 detected weigh-events
 # therefore belong to ONE physical sample; samples are numbered 1..8. The run
@@ -47,6 +53,8 @@ class ScaleApp:
         self.state        = 'WAITING'   # WAITING | SETTLING | RECORDED
         self.meas_count   = 0           # total measurements recorded this run (grows until Stop)
         self.results      = []
+        self.stable_ref   = None        # reference weight for the 20 s stability window
+        self.stable_since = None        # time.monotonic() when the current steady streak began
 
         self._build_ui()
         self._refresh_ports()
@@ -220,9 +228,11 @@ class ScaleApp:
         return self.meas_count % MEAS_PER_SAMPLE + 1
 
     def _start_run(self):
-        self.results    = []
-        self.meas_count = 0
-        self.state      = 'WAITING'
+        self.results      = []
+        self.meas_count   = 0
+        self.state        = 'WAITING'
+        self.stable_ref   = None
+        self.stable_since = None
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._send(b'T\r\n')        # auto-tare the scale at the start of the run
@@ -286,23 +296,41 @@ class ScaleApp:
 
         if self.state == 'WAITING':
             if weight > SAMPLE_THRESHOLD:
-                if stable:
-                    self._record(weight, unit)
-                else:
-                    self.state = 'SETTLING'
-                    self.root.after(0, self.status_var.set,
-                                    f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
-                                    f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — settling...")
+                # Sample detected — begin the 20 s "value must not change" window.
+                self.state        = 'SETTLING'
+                self.stable_ref   = weight
+                self.stable_since = time.monotonic()
+                self.root.after(0, self.status_var.set,
+                                f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
+                                f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — "
+                                f"holding 0/{int(STABILITY_WINDOW)} s...")
 
         elif self.state == 'SETTLING':
             if weight < EMPTY_THRESHOLD:
-                # weight dropped before stable — false alarm, reset
-                self.state = 'WAITING'
+                # weight dropped before it settled — false alarm, reset
+                self.state        = 'WAITING'
+                self.stable_ref   = None
+                self.stable_since = None
                 self.root.after(0, self.status_var.set,
                                 f"Waiting for sample {self._next_sample_num()} · "
                                 f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE}...")
-            elif stable:
-                self._record(weight, unit)
+            elif not stable or abs(weight - self.stable_ref) > STABILITY_TOLERANCE:
+                # value moved (or scale not stable) — restart the 20 s window
+                self.stable_ref   = weight
+                self.stable_since = time.monotonic()
+                self.root.after(0, self.status_var.set,
+                                f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
+                                f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — "
+                                f"value changed, restarting {int(STABILITY_WINDOW)} s...")
+            else:
+                held = time.monotonic() - self.stable_since
+                if held >= STABILITY_WINDOW:
+                    self._record(weight, unit)
+                else:
+                    self.root.after(0, self.status_var.set,
+                                    f"Sample {self._next_sample_num()}/{N_SAMPLES} · "
+                                    f"meas {self._next_meas_num()}/{MEAS_PER_SAMPLE} — "
+                                    f"holding {int(held)}/{int(STABILITY_WINDOW)} s...")
 
         elif self.state == 'RECORDED':
             if weight < EMPTY_THRESHOLD:
